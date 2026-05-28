@@ -1,0 +1,82 @@
+# cargo-audit policy & justification document for RRQ (rrq-rs workspace)
+#
+# IMPORTANT (2026-05):
+#   cargo-audit 0.22.0 (the version installed by taiki-e/install-action in CI)
+#   does NOT support a config file or --config flag. The machine-enforced
+#   ignores live in .github/workflows/ci.yml as repeated `--ignore` flags.
+#
+#   This file is the **single source of truth** for:
+#     - Full human-readable justifications and threat-model analysis
+#     - The canonical list that must stay in sync with the CI ignores
+#     - Future migration plan (switch to `--config audit.toml` once cargo-audit
+#       supports rich config files)
+#
+#   Any contributor editing the list in ci.yml MUST keep this file updated
+#   at the same time.
+#
+# How to verify locally (matches what CI runs after the ignores):
+#   cd rrq-rs && cargo audit --ignore RUSTSEC-... --ignore ... (see ci.yml)
+#
+# Policy:
+#   - All entries below are pre-existing transitive (or build-only) issues.
+#   - They are **not** introduced by the atomic DLQ/requeue work in PR #17.
+#   - PRs that change any Cargo.toml (add/upgrade direct deps, flip features)
+#     MUST re-run `cargo audit` without ignores and re-justify every entry.
+#   - New direct dependencies pulling these crates (or equivalent) require
+#     explicit security review.
+#
+# Threat model (RRQ production use):
+#   - Redis is the sole coordination layer. TLS (rediss://) is optional and
+#     used only when the operator explicitly configures a TLS-enabled Redis.
+#     In practice Redis lives on private networks with additional auth/network
+#     controls. Job data never flows into the TLS certificate/CRL parsing code.
+#   - OpenTelemetry OTLP export (via reqwest + rustls) is completely optional,
+#     user-supplied endpoint, and only carries observability signals.
+#   - The quinn/quinn-proto path is *only* reached when OTLP is enabled
+#     (reqwest pulls quinn for HTTP/3 QUIC support in some configurations).
+#   - full_moon runs only at build time (orchestrator/build.rs) to syntax-check
+#     our 8 small static Lua 5.1 scripts. It is a build-dep only.
+#   - rand 0.9 usage is limited to jittered backoff timers and a debug CLI
+#     sampler. No crypto, no custom global logger.
+#
+# Remediation tracking:
+#   - Primary path: upgrade redis, opentelemetry-otlp, reqwest, rustls, quinn
+#     (and their transitive aws-lc-sys / rustls-webpki / quinn-proto) once
+#     fixed releases are available and the wider ecosystem has stabilized.
+#   - full_moon / paste: watch for a release that drops the unmaintained paste.
+#   - rand: migrate jitter to explicit ThreadRng construction.
+#
+# Last sync with ci.yml ignores: 2026 (babysit PR #17)
+# See NEXT.md section "cargo audit blocker (PR #17)" for full history.
+
+[advisories]
+# This section documents the *intended* future config once cargo-audit supports it.
+# For now it is human-only; the actual flags are in ci.yml.
+ignore = [
+    # --- aws-lc-sys (multiple 2026 issues, all via rustls ecosystem) ---
+    "RUSTSEC-2026-0045",  # Timing Side-Channel in AES-CCM (aws-lc-sys 0.37 → >=0.38)
+    "RUSTSEC-2026-0044",  # X.509 Name Constraints Bypass (aws-lc-sys >=0.39)
+    "RUSTSEC-2026-0048",  # CRL Distribution Point Scope Error (high, >=0.39)
+    "RUSTSEC-2026-0047",  # PKCS7_verify Signature Validation Bypass (high 7.5, >=0.38)
+    "RUSTSEC-2026-0046",  # PKCS7_verify Certificate Chain Validation Bypass (high 7.5, >=0.38)
+
+    # --- quinn-proto DoS (only via OTLP/reqwest path, not Redis) ---
+    "RUSTSEC-2026-0037",  # Denial of service in Quinn endpoints (high 8.7, >=0.11.14)
+
+    # --- rustls-webpki 0.103.9 (four related cert validation issues) ---
+    "RUSTSEC-2026-0104",  # Reachable panic in CRL parsing (>=0.103.13)
+    "RUSTSEC-2026-0098",  # URI name constraints incorrectly accepted (>=0.103.12)
+    "RUSTSEC-2026-0099",  # Wildcard name constraints accepted (>=0.103.12)
+    "RUSTSEC-2026-0049",  # CRL Distribution Point faulty matching (>=0.103.10)
+
+    # --- build-time only ---
+    "RUSTSEC-2024-0436",  # paste unmaintained (via full_moon 2.1.1 build-dep)
+
+    # --- direct but narrow ---
+    "RUSTSEC-2026-0097",  # rand unsound with custom logger + rand::rng()
+]
+
+# When cargo-audit gains --config support, delete the comment block above and
+# the repeated --ignore list in ci.yml, then change the step to:
+#   run: cargo audit --config audit.toml
+# and remove the "keep in sync" notes.

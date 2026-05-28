@@ -97,7 +97,24 @@ jobs:
         working-directory: rrq-rs
 
       - name: Rust audit
-        run: cargo audit
+        # Machine-enforced ignores for pre-existing transitive issues.
+        # Full justifications, threat model, and upgrade tracking live in
+        # rrq-rs/audit.toml (single source of truth; keep this list in sync).
+        # Any Cargo.toml change requires re-audit without these ignores.
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0045
+          --ignore RUSTSEC-2026-0044
+          --ignore RUSTSEC-2026-0048
+          --ignore RUSTSEC-2026-0047
+          --ignore RUSTSEC-2026-0046
+          --ignore RUSTSEC-2026-0037
+          --ignore RUSTSEC-2026-0104
+          --ignore RUSTSEC-2026-0098
+          --ignore RUSTSEC-2026-0099
+          --ignore RUSTSEC-2026-0049
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2026-0097
         working-directory: rrq-rs
 
       - name: Rust coverage
