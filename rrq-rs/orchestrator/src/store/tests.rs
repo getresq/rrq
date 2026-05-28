@@ -39,6 +39,8 @@ async fn lua_scripts_compile_in_redis() {
         RELEASE_LOCK_IF_OWNER_LUA,
         RETRY_LUA,
         ENQUEUE_LUA,
+        MOVE_TO_DLQ_LUA,
+        REQUEUE_JOB_LUA,
     ] {
         let sha: String = redis::cmd("SCRIPT")
             .arg("LOAD")
@@ -566,6 +568,78 @@ async fn job_store_save_job_result_emits_event_stream_and_applies_ttl() {
         .unwrap();
     assert!(events_ttl > 0);
     assert!(events_ttl <= 30);
+}
+
+#[tokio::test]
+async fn atomic_requeue_already_queued_demotes_active_job() {
+    let mut ctx = RedisTestContext::new().await.unwrap();
+    let queue_name = ctx.settings.default_queue_name.clone();
+    let dlq_name = ctx.settings.default_dlq_name.clone();
+    let mut job = build_job(&queue_name, &dlq_name);
+    let worker_id = format!("worker-{}", job.id);
+    let start_time = Utc::now();
+    job.status = JobStatus::Active;
+    job.start_time = Some(start_time);
+    job.worker_id = Some(worker_id.clone());
+    ctx.store.save_job_definition(&job).await.unwrap();
+    ctx.store
+        .add_job_to_queue(&queue_name, &job.id, start_time.timestamp_millis() as f64)
+        .await
+        .unwrap();
+    ctx.store
+        .track_active_job(&worker_id, &job.id, start_time)
+        .await
+        .unwrap();
+    assert!(
+        ctx.store
+            .try_lock_job(&job.id, &worker_id, 30_000)
+            .await
+            .unwrap()
+    );
+
+    let result = ctx
+        .store
+        .atomic_requeue_job(
+            &job.id,
+            &queue_name,
+            start_time.timestamp_millis() as f64,
+            "Recovered after lock expiry or worker crash.",
+            &worker_id,
+            Some(&worker_id),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, 2);
+    let loaded = ctx
+        .store
+        .get_job_definition(&job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.status, JobStatus::Pending);
+    assert_eq!(
+        loaded.last_error.as_deref(),
+        Some("Recovered after lock expiry or worker crash.")
+    );
+    assert!(loaded.start_time.is_none());
+    assert!(loaded.worker_id.is_none());
+    assert!(
+        ctx.store
+            .get_active_job_ids(&worker_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        ctx.store
+            .get_job_lock_owner(&job.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(ctx.store.queue_size(&queue_name).await.unwrap(), 1);
 }
 
 #[tokio::test]

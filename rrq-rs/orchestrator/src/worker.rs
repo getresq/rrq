@@ -1892,7 +1892,7 @@ async fn recover_orphaned_jobs(
                     };
                     let next_scheduled_str = requeue_time.to_rfc3339();
 
-                    let result = job_store
+                    let result = match job_store
                         .atomic_requeue_job(
                             &job.id,
                             &queue_name,
@@ -1903,7 +1903,19 @@ async fn recover_orphaned_jobs(
                             Some(&next_scheduled_str),
                         )
                         .await
-                        .unwrap_or(-1);
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::warn!(
+                                "atomic requeue failed for orphaned job {}: {err}",
+                                job.id
+                            );
+                            let _ = job_store
+                                .release_job_lock_if_owner(&job.id, &lock_owner)
+                                .await;
+                            continue;
+                        }
+                    };
 
                     if result == 1 {
                         tracing::warn!(
@@ -1911,21 +1923,27 @@ async fn recover_orphaned_jobs(
                             job_id = %job.id,
                             "atomically re-queued orphaned job after health TTL expiry"
                         );
-                    } else if result < 0 {
+                    }
+                    let post_action = orphan_requeue_post_action(result);
+                    if post_action == OrphanRequeuePostAction::PreserveActive {
                         tracing::warn!(
-                            "atomic requeue returned error sentinel for orphaned job {} (check Redis logs)",
+                            "atomic requeue returned non-cleanup result {result} for orphaned job {} (check Redis logs)",
                             job.id
                         );
+                        let _ = job_store
+                            .release_job_lock_if_owner(&job.id, &lock_owner)
+                            .await;
+                        continue;
                     }
-                    // result == 0 (job gone) or 2 (became queued between checks) or error:
-                    // still ensure synthetic active/lock tracking we created is cleaned.
+                    // result == 0 (job gone), 1 (requeued), or 2 (became queued between checks):
+                    // ensure synthetic active/lock tracking we created is cleaned.
                     // For 1/2 the atomic already performed the ZREM + owner-checked DEL.
                     let _ = job_store.remove_active_job(worker_id, &job.id).await;
                     let _ = job_store
                         .release_job_lock_if_owner(&job.id, &lock_owner)
                         .await;
 
-                    if result == 1 || result == 2 {
+                    if post_action == OrphanRequeuePostAction::CleanupAndCount {
                         recovered += 1;
                         if recovered >= MAX_RECOVERIES_PER_TICK {
                             recovery_limited = true;
@@ -1961,6 +1979,21 @@ async fn recover_orphaned_jobs(
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanRequeuePostAction {
+    CleanupOnly,
+    CleanupAndCount,
+    PreserveActive,
+}
+
+fn orphan_requeue_post_action(result: i64) -> OrphanRequeuePostAction {
+    match result {
+        0 => OrphanRequeuePostAction::CleanupOnly,
+        1 | 2 => OrphanRequeuePostAction::CleanupAndCount,
+        _ => OrphanRequeuePostAction::PreserveActive,
+    }
 }
 
 async fn cron_loop(

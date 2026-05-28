@@ -30,6 +30,19 @@ local function run()
         return 0
     end
 
+    -- If it was ACTIVE, demote to PENDING and clear transient fields (matches mark_job_pending).
+    -- Do this even if the job is already queued so the hash cannot remain stale ACTIVE.
+    local current_status = redis.call('HGET', job_key, 'status')
+    if current_status == 'ACTIVE' then
+        redis.call('HMSET', job_key, 'status', 'PENDING', 'last_error', requeue_message)
+        redis.call('HDEL', job_key, 'start_time', 'worker_id')
+    else
+        -- Still record the requeue reason for diagnostics
+        if requeue_message and requeue_message ~= '' then
+            redis.call('HSET', job_key, 'last_error', requeue_message)
+        end
+    end
+
     -- Already visible in the target queue? Clean up our tracking only.
     if redis.call('ZSCORE', queue_key, job_id) then
         if active_key and active_key ~= '' then
@@ -45,18 +58,6 @@ local function run()
     end
 
     -- Not queued — perform the requeue.
-    -- If it was ACTIVE, demote to PENDING and clear transient fields (matches mark_job_pending).
-    local current_status = redis.call('HGET', job_key, 'status')
-    if current_status == 'ACTIVE' then
-        redis.call('HMSET', job_key, 'status', 'PENDING', 'last_error', requeue_message)
-        redis.call('HDEL', job_key, 'start_time', 'worker_id')
-    else
-        -- Still record the requeue reason for diagnostics
-        if requeue_message and requeue_message ~= '' then
-            redis.call('HSET', job_key, 'last_error', requeue_message)
-        end
-    end
-
     -- Put it back in the time-sorted queue (score may be "now" or a future scheduled time)
     redis.call('ZADD', queue_key, score, job_id)
 

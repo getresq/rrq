@@ -20,8 +20,9 @@
 # Policy:
 #   - All entries below are pre-existing transitive (or build-only) issues.
 #   - They are **not** introduced by the atomic DLQ/requeue work in PR #17.
-#   - PRs that change any Cargo.toml (add/upgrade direct deps, flip features)
-#     MUST re-run `cargo audit` without ignores and re-justify every entry.
+#   - CI runs strict `cargo audit` without ignores for PRs that change
+#     rrq-rs/Cargo.toml, rrq-rs/**/Cargo.toml, or rrq-rs/Cargo.lock.
+#   - PRs that change dependency inputs MUST re-justify every remaining entry.
 #   - New direct dependencies pulling these crates (or equivalent) require
 #     explicit security review.
 #

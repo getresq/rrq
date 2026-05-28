@@ -17,7 +17,7 @@ Close the two high-severity atomicity gaps identified in the production audit:
 - [x] Create NEXT.md (this file) and keep it updated after every chunk
 - [x] Get explicit approval for implementation strategy ("Yeah - go for the Proposed concrete path forward (minimal + safe)")
 - [x] Chunk 1: move_to_dlq.lua + requeue_job.lua (pcall + optional next_scheduled) + build.rs — written + cargo check passed + subagent review ("Ship after fixes") + two comment fixes applied for pcall rollback accuracy + TTL wording + final cargo check green. Ready to unblock Chunk 2.
-- [x] Chunk 2: store.rs — consts + Script fields + atomic_move_job_to_dlq + atomic_requeue_job (exact atomic_retry_job pattern) + fmt/clippy -D warnings clean (local allow with justification) + subagent review "Ready for worker.rs call-site work" (zero blocking; 3 cosmetic nits applied). 
+- [x] Chunk 2: store.rs — consts + Script fields + atomic_move_job_to_dlq + atomic_requeue_job (exact atomic_retry_job pattern) + fmt/clippy -D warnings clean (local allow with justification) + subagent review "Ready for worker.rs call-site work" (zero blocking; 3 cosmetic nits applied).
 - [x] Chunk 3a (first worker micro-chunk): Migrated all four terminal DLQ paths + upgraded move_to_dlq helper to atomic_move_job_to_dlq. Zero findings. "Ready to proceed".
 - [x] Chunk 3b (drain requeue): Replaced the multi-command walk in drain_tasks with atomic_requeue_job (score=now, owner-checked lock release inside script, return-code driven logging, -1 sentinel handling). Post-loop cleanup left unconditional (harmless on success). Subagent review: "Ready for orphan consideration or full test matrix" — two Should polish items (noted, not blocking). fmt/clippy clean after structure fix. Shutdown half of the original race is now atomic.
 - [x] Subagent reviews completed for Chunk 1 (Lua+build) and Chunk 2 (store.rs) — both "ship / ready to proceed". Next review queued for Chunk 3 (worker call sites).
@@ -192,9 +192,98 @@ Last updated: 2026 (successful Redis-backed matrix on 56379/15 + clean push of t
 **Next after this section:**
 - Launch check subagent.
 - Address any findings.
+
+## Re-verification of Cursor Bugbot Medium (unique_lock_key via ARGV not KEYS)
+
+**Date:** 2026 (user explicit follow-up question: "Did you address this?" + pasted the original Bugbot text)
+
+**Action taken:**
+- Opened fresh 4-item todo list.
+- Read current `rrq-rs/orchestrator/src/lua/move_to_dlq.lua` (full) and the `atomic_move_job_to_dlq` implementation + doc in `rrq-rs/orchestrator/src/store.rs`.
+- Confirmed via `git log` that fix commit **2064f66** ("fix(orchestrator): declare unique lock key via KEYS[4] in move_to_dlq.lua (addresses Cursor Bugbot review)") is present on the branch.
+- Showed the exact diff of 2064f66 (moved from ARGV[5] → KEYS[4] + 4th `.key()`, ARGV count reduced, doc updated, matches requeue_job.lua pattern).
+- Launched a new **narrowly scoped** check subagent (general-purpose, subagent_id 019e6f34-cddf-7903-98ec-f2e7bdbe369e) whose only job was to verify this single Bugbot Medium item against the current on-disk state + git history + build hygiene.
+
+**Fresh subagent result (VERDICT: PASS):**
+- Current contract (both files): exactly **4 KEYS + 4 ARGV**.
+- `move_to_dlq.lua:1`: `-- KEYS: [1] = job_key, [2] = events_key, [3] = dlq_key, [4] = unique_lock_key ...`
+- `move_to_dlq.lua:14`: `local unique_lock_key = KEYS[4]`
+- `move_to_dlq.lua:48-50`: conditional `redis.call('DEL', unique_lock_key)` only on a KEYS-derived value (with `~= ''` guard).
+- `store.rs:796-799`: four consecutive `.key(...)` calls ending in `.key(unique)`, followed by four `.arg(...)`.
+- Doc comment in store.rs explicitly calls out "All keys touched by the script (including the optional unique lock) are declared in the KEYS array for Redis Cluster compatibility."
+- Consistency: identical empty-string sentinel + guard pattern as `requeue_job.lua`.
+- `cargo fmt -- --check` + `cargo clippy -- -D warnings`: both clean (exit 0).
+- Git evidence, line numbers, and quotes all recorded in the subagent report.
+
+**Conclusion:** Yes — the exact issue the user pasted was addressed in commit 2064f66, the fix is still present and correct on the current tip of the branch (c433f95), and a fresh independent subagent just re-confirmed it with VERDICT: PASS.
+
+This re-verification was tracked here per project rules. The PR comment posted during babysit already called out the fix + subagent PASS for reviewers.
+
+Last updated: 2026 (targeted re-verification of the original Bugbot Medium finding)
 - Conventional commit + normal `git push`.
 - Re-poll `gh pr checks` (the rust job should now be green on the new commit).
 - Reply to the two Cursor Bugbot threads (the Lua KEYS Medium is already fixed in pushed commit 2064f66 + subagent; the Low tracking-files note now has this additional context in NEXT.md).
 - Continue 5 m babysit loop until `reviewDecision: APPROVED` or all checks green + no new comments.
 
 Last updated: 2026 (cargo audit remediation implemented + verified locally)
+
+## Independent Verification of Cursor Bugbot Medium Finding (Lua KEYS/ARGV for unique_lock_key)
+**Date:** 2026-05-28 (this session, on latest commit c433f95 of branch fix/orchestrator-atomic-dlq-requeue)
+**Task:** Expert verifier run per explicit narrow workflow: full reads of move_to_dlq.lua + store.rs atomic_move... + git history confirmation of 2064f66 + consistency vs requeue_job.lua + cargo fmt+clippy -D in rrq-rs + precise contract + PASS/FAIL verdict in mandated format.
+**Scope:** *Only* the Bugbot "Lua script accesses Redis key via ARGV, not KEYS" Medium item. Nothing else in PR.
+
+**Actions performed (tracked per rules):**
+- Confirmed branch + commit 2064f66 "fix(orchestrator): declare unique lock key via KEYS[4]..." present.
+- Direct file reads (no summaries).
+- git show diff confirmed exact pre-fix (ARGV[5] + no 4th key) → post-fix (KEYS[4] + 4th .key(), ARGV reduced).
+- requeue_job.lua cross-check: identical optional-key-via-empty-string-in-KEYS + conditional ~= '' pattern.
+- `cargo fmt -- --check`: exit 0 (clean).
+- `cargo clippy -- -D warnings`: exit 0, zero lints (Finished cleanly).
+- NEXT.md updated for this verification chunk (mission tracking).
+
+**Result recorded in mandated output format below.** (Full verbatim report follows in response; also referenced here for auditability.)
+- This verification is an additional direct expert run; prior subagent (check skill) on the fix chunk also returned PASS per NEXT history.
+- Guardrails: todo_write used (7 items), one in_progress at a time, tool-first, reads before any analysis, precise line nums/quotes, no scope creep.
+
+Last updated: 2026 (independent Bugbot Medium verification completed + tracked; see detailed verdict in session output)
+
+## Fix Review Findings From PR #17 Code Review
+**Date:** 2026-05-28
+**Mission:** Fix the High and Medium review findings from the PR #17 review, with validation before edits and regression coverage for confirmed runtime defects.
+
+**Checklist:**
+- [x] Validate High: orphan recovery must not remove active tracking when atomic requeue errors.
+- [x] Validate Medium: `requeue_job.lua` return `2` path leaves ACTIVE jobs stale.
+- [x] Validate Medium: CI audit ignore policy is documentation-only and needs an enforceable strict path for dependency changes.
+- [x] Patch runtime behavior.
+- [x] Add focused regression tests.
+- [x] Patch audit CI guard.
+- [x] Run fmt/checks/tests.
+- [x] Launch subagent review for the completed chunk and address findings.
+
+**Verdicts before editing:**
+- `confirmed`: orphan recovery currently maps `Err` to `-1`, then removes active tracking even though the job may not have been queued.
+- `confirmed`: `requeue_job.lua` returns `2` before ACTIVE demotion and transient field cleanup.
+- `confirmed`: audit ignores are enforced, but strict re-audit on dependency changes is only a comment.
+
+**Fixes applied:**
+- `requeue_job.lua`: demote/clean ACTIVE jobs before the already-queued return path.
+- `recover_orphaned_jobs`: preserve the dead worker active-set entry on atomic requeue `Err`, `-1`, or unexpected return codes; only clean active state for `0`, `1`, or `2`.
+- `ci.yml`: strict `cargo audit` runs on Rust Cargo manifest/lockfile changes; otherwise the documented ignore list is used.
+
+**Verification so far:**
+- `cargo fmt --all -- --check`: pass.
+- `cargo clippy --all-targets --all-features -- -D warnings`: pass.
+- `RRQ_TEST_REDIS_DSN=redis://localhost:56379/15 cargo test -p rrq --lib -- --test-threads=1`: 135 passed.
+- `RRQ_TEST_REDIS_DSN=redis://localhost:56379/15 cargo test -- --test-threads=1`: pass.
+- CI audit branch simulation: no Rust dependency files changed, ignored-advisory path passes.
+
+**Subagent review round 1:** FAIL.
+- Medium confirmed: CI pathspec missed top-level `rrq-rs/Cargo.toml`.
+- Low accepted: worker regression test only covered a boolean helper, not the cleanup/count/preserve action.
+
+**Round 1 fixes:**
+- Added `:(top)rrq-rs/Cargo.toml` to the strict-audit dependency pathspec.
+- Replaced the boolean helper with `OrphanRequeuePostAction` so tests assert cleanup-only, cleanup-and-count, or preserve-active behavior directly.
+
+**Subagent review round 2:** PASS (no actionable findings).

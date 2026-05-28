@@ -71,6 +71,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -100,21 +102,37 @@ jobs:
         # Machine-enforced ignores for pre-existing transitive issues.
         # Full justifications, threat model, and upgrade tracking live in
         # rrq-rs/audit.toml (single source of truth; keep this list in sync).
-        # Any Cargo.toml change requires re-audit without these ignores.
-        run: >-
-          cargo audit
-          --ignore RUSTSEC-2026-0045
-          --ignore RUSTSEC-2026-0044
-          --ignore RUSTSEC-2026-0048
-          --ignore RUSTSEC-2026-0047
-          --ignore RUSTSEC-2026-0046
-          --ignore RUSTSEC-2026-0037
-          --ignore RUSTSEC-2026-0104
-          --ignore RUSTSEC-2026-0098
-          --ignore RUSTSEC-2026-0099
-          --ignore RUSTSEC-2026-0049
-          --ignore RUSTSEC-2024-0436
-          --ignore RUSTSEC-2026-0097
+        # Rust dependency changes require strict re-audit without these ignores.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_dependency_files="$(
+            git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" \
+              -- ':(top)rrq-rs/Cargo.toml' ':(top)rrq-rs/**/Cargo.toml' ':(top)rrq-rs/Cargo.lock'
+          )"
+
+          if [[ -n "$changed_dependency_files" ]]; then
+            echo "Rust dependency files changed; running strict cargo audit:"
+            echo "$changed_dependency_files"
+            cargo audit
+          else
+            cargo audit \
+              --ignore RUSTSEC-2026-0045 \
+              --ignore RUSTSEC-2026-0044 \
+              --ignore RUSTSEC-2026-0048 \
+              --ignore RUSTSEC-2026-0047 \
+              --ignore RUSTSEC-2026-0046 \
+              --ignore RUSTSEC-2026-0037 \
+              --ignore RUSTSEC-2026-0104 \
+              --ignore RUSTSEC-2026-0098 \
+              --ignore RUSTSEC-2026-0099 \
+              --ignore RUSTSEC-2026-0049 \
+              --ignore RUSTSEC-2024-0436 \
+              --ignore RUSTSEC-2026-0097
+          fi
         working-directory: rrq-rs
 
       - name: Rust coverage
