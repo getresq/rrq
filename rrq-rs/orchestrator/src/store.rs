@@ -20,6 +20,8 @@ const REFRESH_LOCK_LUA: &str = include_str!("lua/refresh_lock.lua");
 const RELEASE_LOCK_IF_OWNER_LUA: &str = include_str!("lua/release_lock_if_owner.lua");
 const RETRY_LUA: &str = include_str!("lua/retry.lua");
 const ENQUEUE_LUA: &str = include_str!("lua/enqueue.lua");
+const MOVE_TO_DLQ_LUA: &str = include_str!("lua/move_to_dlq.lua");
+const REQUEUE_JOB_LUA: &str = include_str!("lua/requeue_job.lua");
 
 fn summarize_redis_dsn(dsn: &str) -> String {
     let (scheme, rest) = dsn.split_once("://").unwrap_or(("", dsn));
@@ -80,6 +82,8 @@ pub struct JobStore {
     release_lock_if_owner_script: Script,
     retry_script: Script,
     enqueue_script: Script,
+    move_to_dlq_script: Script,
+    requeue_job_script: Script,
 }
 
 impl JobStore {
@@ -103,6 +107,8 @@ impl JobStore {
         let release_lock_if_owner_script = Script::new(RELEASE_LOCK_IF_OWNER_LUA);
         let retry_script = Script::new(RETRY_LUA);
         let enqueue_script = Script::new(ENQUEUE_LUA);
+        let move_to_dlq_script = Script::new(MOVE_TO_DLQ_LUA);
+        let requeue_job_script = Script::new(REQUEUE_JOB_LUA);
 
         Self {
             settings,
@@ -113,6 +119,8 @@ impl JobStore {
             release_lock_if_owner_script,
             retry_script,
             enqueue_script,
+            move_to_dlq_script,
+            requeue_job_script,
         }
     }
 
@@ -759,6 +767,90 @@ impl JobStore {
             .invoke_async(&mut self.conn)
             .await?;
         Ok(new_retry_count)
+    }
+
+    /// Atomically increment retries, mark FAILED, record failure event, push to DLQ,
+    /// set TTLs, and optionally release a unique lock key. Replaces the previous split
+    /// `increment_job_retries` + `move_job_to_dlq` + conditional release pattern.
+    ///
+    /// All keys touched by the script (including the optional unique lock) are declared
+    /// in the KEYS array for Redis Cluster compatibility.
+    ///
+    /// Returns the new retry count on success, or -1 on script error (pcall sentinel per move_to_dlq.lua header; check Redis server logs).
+    pub async fn atomic_move_job_to_dlq(
+        &mut self,
+        job_id: &str,
+        dlq_name: &str,
+        error_message: &str,
+        completion_time: DateTime<Utc>,
+        dlq_result_ttl_seconds: i64,
+        unique_lock_key: Option<&str>,
+    ) -> Result<i64> {
+        let job_key = format!("{JOB_KEY_PREFIX}{job_id}");
+        let events_key = format_job_events_key(job_id);
+        let dlq_key = self.format_dlq_key(dlq_name);
+        let unique = unique_lock_key.unwrap_or("");
+
+        let retry_count: i64 = self
+            .move_to_dlq_script
+            .key(job_key)
+            .key(events_key)
+            .key(dlq_key)
+            .key(unique)
+            .arg(job_id)
+            .arg(error_message)
+            .arg(completion_time.to_rfc3339())
+            .arg(dlq_result_ttl_seconds)
+            .invoke_async(&mut self.conn)
+            .await?;
+
+        Ok(retry_count)
+    }
+
+    /// Atomically re-queue a job (ZADD with provided score), optionally demote ACTIVE→PENDING,
+    /// clean up active set + owner-checked lock release, and (for orphan/cron paths) restore
+    /// next_scheduled_run_time. This is the single-roundtrip replacement for the multi-command
+    /// walks in drain_tasks and recover_orphaned_jobs.
+    ///
+    /// Returns:
+    ///   0 = job did not exist (no-op)
+    ///   1 = successfully re-queued
+    ///   2 = already present in target queue (cleaned tracking only)
+    ///  -1 = script error (check Redis logs; partial commands before failure may have executed)
+    #[allow(clippy::too_many_arguments)] // Mirrors the 9-value Lua script contract (4 keys + 5 args); callers supply distinct semantic values.
+    pub async fn atomic_requeue_job(
+        &mut self,
+        job_id: &str,
+        queue_name: &str,
+        score: f64,
+        requeue_message: &str,
+        releasing_owner: &str,
+        active_worker_id: Option<&str>,
+        next_scheduled_run_time: Option<&str>,
+    ) -> Result<i64> {
+        let job_key = format!("{JOB_KEY_PREFIX}{job_id}");
+        let queue_key = self.format_queue_key(queue_name);
+        let active_key = active_worker_id
+            .map(|w| format!("{ACTIVE_JOBS_PREFIX}{w}"))
+            .unwrap_or_default();
+        let lock_key = format!("{LOCK_KEY_PREFIX}{job_id}");
+        let next_sched = next_scheduled_run_time.unwrap_or("");
+
+        let result: i64 = self
+            .requeue_job_script
+            .key(job_key)
+            .key(queue_key)
+            .key(active_key)
+            .key(lock_key)
+            .arg(job_id)
+            .arg(score)
+            .arg(requeue_message)
+            .arg(releasing_owner)
+            .arg(next_sched)
+            .invoke_async(&mut self.conn)
+            .await?;
+
+        Ok(result)
     }
 
     pub async fn increment_job_retries(&mut self, job_id: &str) -> Result<i64> {

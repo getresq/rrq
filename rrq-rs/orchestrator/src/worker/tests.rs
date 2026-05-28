@@ -591,6 +591,30 @@ async fn recover_orphaned_jobs_respects_limit() {
     assert!(!active.is_empty());
 }
 
+#[test]
+fn orphan_requeue_post_action_preserves_active_on_errors() {
+    assert_eq!(
+        orphan_requeue_post_action(0),
+        OrphanRequeuePostAction::CleanupOnly
+    );
+    assert_eq!(
+        orphan_requeue_post_action(1),
+        OrphanRequeuePostAction::CleanupAndCount
+    );
+    assert_eq!(
+        orphan_requeue_post_action(2),
+        OrphanRequeuePostAction::CleanupAndCount
+    );
+    assert_eq!(
+        orphan_requeue_post_action(-1),
+        OrphanRequeuePostAction::PreserveActive
+    );
+    assert_eq!(
+        orphan_requeue_post_action(3),
+        OrphanRequeuePostAction::PreserveActive
+    );
+}
+
 #[tokio::test]
 async fn poll_for_jobs_distributes_across_queues() {
     let mut ctx = RedisTestContext::new().await.unwrap();
