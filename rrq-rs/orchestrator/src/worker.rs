@@ -16,7 +16,9 @@ use tracing::{Instrument, field::Empty};
 use uuid::Uuid;
 
 use crate::client::{EnqueueOptions, RRQClient};
-use crate::constants::DEFAULT_WORKER_ID_PREFIX;
+use crate::constants::{
+    DEFAULT_DLQ_RESULT_TTL_SECONDS, DEFAULT_WORKER_ID_PREFIX, UNIQUE_JOB_LOCK_PREFIX,
+};
 use crate::job::{Job, JobStatus};
 use crate::runner::{Runner, RunnerExecutionResult};
 use crate::store::JobStore;
@@ -1020,29 +1022,39 @@ impl RRQWorker {
                 Some(JobStatus::Active | JobStatus::Pending | JobStatus::Retrying)
             );
             if should_requeue {
-                let already_queued = store
-                    .is_job_queued(&info.queue_name, &job_id)
+                let score = Utc::now().timestamp_millis() as f64;
+                let requeue_message = if status == Some(JobStatus::Active) {
+                    "Job execution interrupted by worker shutdown. Re-queued."
+                } else {
+                    ""
+                };
+
+                let result = store
+                    .atomic_requeue_job(
+                        &job_id,
+                        &info.queue_name,
+                        score,
+                        requeue_message,
+                        &self.worker_id,
+                        Some(&self.worker_id),
+                        None, // shutdown always forces "now"; no next_scheduled preservation
+                    )
                     .await
-                    .unwrap_or(false);
-                if !already_queued {
+                    .unwrap_or(-1);
+
+                if result == 1 {
                     tracing::warn!("re-queueing job {} after shutdown", job_id);
-                    if status == Some(JobStatus::Active) {
-                        let _ = store
-                            .mark_job_pending(
-                                &job_id,
-                                Some("Job execution interrupted by worker shutdown. Re-queued."),
-                            )
-                            .await;
-                    }
-                    let _ = store
-                        .add_job_to_queue(
-                            &info.queue_name,
-                            &job_id,
-                            Utc::now().timestamp_millis() as f64,
-                        )
-                        .await;
+                } else if result < 0 {
+                    tracing::warn!(
+                        "atomic requeue returned error sentinel for job {} after shutdown (check Redis logs)",
+                        job_id
+                    );
                 }
+                // result == 0 (missing) or 2 (already queued) are silent no-ops, matching prior best-effort behavior
             }
+
+            // Defensive cleanup for every job (harmless no-op for successful requeues, which already did
+            // ZREM + owner-checked lock release inside atomic_requeue_job).
             if let Err(err) = store.remove_active_job(&self.worker_id, &job_id).await {
                 tracing::warn!("failed to remove active job {job_id}: {err}");
             }
@@ -1562,7 +1574,6 @@ async fn handle_job_timeout(
     job_store: &mut JobStore,
     error_message: &str,
 ) -> Result<()> {
-    job_store.increment_job_retries(&job.id).await?;
     move_to_dlq(job, queue_name, job_store, error_message).await?;
     Ok(())
 }
@@ -1573,7 +1584,6 @@ async fn handle_fatal_job_error(
     error_message: &str,
     job_store: &mut JobStore,
 ) -> Result<()> {
-    job_store.increment_job_retries(&job.id).await?;
     move_to_dlq(job, queue_name, job_store, error_message).await?;
     Ok(())
 }
@@ -1588,18 +1598,38 @@ async fn move_to_dlq(
         .dlq_name
         .clone()
         .unwrap_or_else(|| job_store.settings().default_dlq_name.clone());
-    job_store
-        .move_job_to_dlq(&job.id, &dlq_name, error_message, Utc::now())
+
+    let unique_lock_key = job
+        .job_unique_key
+        .as_ref()
+        .map(|k| format!("{UNIQUE_JOB_LOCK_PREFIX}{k}"));
+
+    let result = job_store
+        .atomic_move_job_to_dlq(
+            &job.id,
+            &dlq_name,
+            error_message,
+            Utc::now(),
+            DEFAULT_DLQ_RESULT_TTL_SECONDS,
+            unique_lock_key.as_deref(),
+        )
         .await?;
+
+    if result < 0 {
+        tracing::error!(
+            "rrq.job_id" = %job.id,
+            "rrq.dlq" = %dlq_name,
+            "atomic move to dlq script returned error sentinel; check Redis logs for details"
+        );
+        anyhow::bail!("atomic move to dlq failed for job {}", job.id);
+    }
+
     tracing::warn!(
         "rrq.job_id" = %job.id,
         "rrq.dlq" = %dlq_name,
         error_message = %error_message,
         "job moved to dlq"
     );
-    if let Some(unique_key) = job.job_unique_key.as_ref() {
-        job_store.release_unique_job_lock(unique_key).await?;
-    }
     Ok(())
 }
 
@@ -1619,7 +1649,6 @@ async fn process_retry_job(
             max_retries = job.max_retries,
             "retry budget exhausted; moving job to dlq"
         );
-        job_store.increment_job_retries(&job.id).await?;
         move_to_dlq(job, queue_name, job_store, error_message).await?;
         return Ok(());
     }
@@ -1679,7 +1708,6 @@ async fn process_failure_job(
             max_retries = job.max_retries,
             "failure exhausted retry budget; moving job to dlq"
         );
-        job_store.increment_job_retries(&job.id).await?;
         move_to_dlq(job, queue_name, job_store, error_message).await?;
         return Ok(());
     }
@@ -1856,29 +1884,53 @@ async fn recover_orphaned_jobs(
                     JobStatus::Active | JobStatus::Pending | JobStatus::Retrying
                 ) {
                     let requeue_time = job.next_scheduled_run_time.unwrap_or_else(Utc::now);
-                    let score_ms = requeue_time.timestamp_millis() as f64;
-                    job_store
-                        .add_job_to_queue(&queue_name, &job.id, score_ms)
-                        .await?;
-                    if job.status == JobStatus::Active {
-                        let _ = job_store
-                            .mark_job_pending(
-                                &job.id,
-                                Some("Recovered after lock expiry or worker crash."),
-                            )
-                            .await;
+                    let score = requeue_time.timestamp_millis() as f64;
+                    let requeue_message = if job.status == JobStatus::Active {
+                        "Recovered after lock expiry or worker crash."
+                    } else {
+                        ""
+                    };
+                    let next_scheduled_str = requeue_time.to_rfc3339();
+
+                    let result = job_store
+                        .atomic_requeue_job(
+                            &job.id,
+                            &queue_name,
+                            score,
+                            requeue_message,
+                            &lock_owner,
+                            Some(worker_id),
+                            Some(&next_scheduled_str),
+                        )
+                        .await
+                        .unwrap_or(-1);
+
+                    if result == 1 {
+                        tracing::warn!(
+                            event = "rrq.orphan_requeued",
+                            job_id = %job.id,
+                            "atomically re-queued orphaned job after health TTL expiry"
+                        );
+                    } else if result < 0 {
+                        tracing::warn!(
+                            "atomic requeue returned error sentinel for orphaned job {} (check Redis logs)",
+                            job.id
+                        );
                     }
-                    let _ = job_store
-                        .update_job_next_scheduled_run_time(&job.id, requeue_time)
-                        .await;
+                    // result == 0 (job gone) or 2 (became queued between checks) or error:
+                    // still ensure synthetic active/lock tracking we created is cleaned.
+                    // For 1/2 the atomic already performed the ZREM + owner-checked DEL.
                     let _ = job_store.remove_active_job(worker_id, &job.id).await;
                     let _ = job_store
                         .release_job_lock_if_owner(&job.id, &lock_owner)
                         .await;
-                    recovered += 1;
-                    if recovered >= MAX_RECOVERIES_PER_TICK {
-                        recovery_limited = true;
-                        break 'scan;
+
+                    if result == 1 || result == 2 {
+                        recovered += 1;
+                        if recovered >= MAX_RECOVERIES_PER_TICK {
+                            recovery_limited = true;
+                            break 'scan;
+                        }
                     }
                 } else {
                     let _ = job_store.remove_active_job(worker_id, &job.id).await;

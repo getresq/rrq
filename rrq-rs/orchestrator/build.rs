@@ -8,6 +8,8 @@ const LUA_SCRIPTS: &[&str] = &[
     "src/lua/release_lock_if_owner.lua",
     "src/lua/retry.lua",
     "src/lua/enqueue.lua",
+    "src/lua/move_to_dlq.lua",
+    "src/lua/requeue_job.lua",
 ];
 
 fn main() {
