@@ -107,3 +107,28 @@ Last updated: 2026 (Chunk 3c + review PASS + full matrix executed)
 **Recommendation:** In CI or a dev shell with `redis-server` (or `docker run -p 6379:6379 redis`), re-run the matrix — the new atomic code will be exercised by the previously-failing test names (especially `recover_orphaned_jobs_*`, `drain_tasks_*`, store atomic claim/retry/dlq flows, worker timeout/fatal paths). Expect those to turn green.
 
 No action required from the atomicity changes; the work is complete and ready for commit once run in a full environment.
+
+## PR
+- **https://github.com/getresq/rrq/pull/17**
+- Branch: `fix/orchestrator-atomic-dlq-requeue`
+- Commit: `fa746af` (the single conventional commit for the entire hardening effort)
+- Opened: immediately after push + rich reviewer body (includes the two risks, Lua contracts, review loop, matrix status, and explicit checklist for reviewers who have Redis).
+
+## Babysit Phase (post-PR, per explicit "babysit the pr" request)
+- Activated dedicated babysit skill + fresh todo list + mission alignment check.
+- Polled `gh pr checks`, `gh pr view --json reviews/comments`, inline review comments via API.
+- **CI status**: "rust" workflow red due to `cargo audit` (10 pre-existing high/medium RUSTSECs in aws-lc-sys, rustls-webpki, quinn-proto transitive deps from redis/reqwest/opentelemetry stack). "test", "typescript", "packaging" jobs all green. The core "test" job exercises fmt/clippy/build.rs (Lua validation) + our atomic paths — no regressions from the hardening. Audit failure is unrelated to the PR changes.
+- **Review comments**: Two from Cursor Bugbot on fa746af.
+  - Medium: `unique_lock_key` used for DEL but declared only in ARGV[5], not KEYS[] (cluster/CROSSSLOT correctness). Exact locations in move_to_dlq.lua + store.rs.
+  - Low: MISSION.md / NEXT.md as AI tracking noise (not mandated in top-level docs).
+  - Codex bot hit rate limits on the @codex review attempt.
+- **Immediate action on real finding (code → subagent review gate)**:
+  - Fixed in working tree: moved unique_lock_key to KEYS[4] in move_to_dlq.lua (header + binding), added 4th `.key()` in atomic_move_job_to_dlq (store.rs), removed from ARGV, updated docs. Minimal, behavior-preserving, matches requeue_job.lua pattern exactly. "" sentinel for optional case retained.
+  - `cd rrq-rs && cargo fmt && cargo clippy -- -D warnings`: clean (exit 0).
+  - Launched check skill subagent (general-purpose verifier, focused on the Bugbot Medium item + full trace). **VERDICT: PASS** (subagent_id 019e6f21-7642-7a23-bb43-2d95a56a58ce). Confirmed: correct contract (4 KEYS + 4 ARGV), full_moon still happy, no regressions, hygiene reproduced by verifier, zero issues.
+  - (Tracking files Low item + .DS_Store hygiene + audit comment to be addressed in follow-up commits + PR replies below.)
+- Local working tree: fix + small post-PR doc updates + .DS_Store (to be cleaned).
+- Next: conventional commit for the KEYS fix (new commit), hygiene commit (rm .DS_Store + doc updates), push, reply to Bugbot threads (fix + explanation for tracking files), re-poll checks, continue 5m monitoring loop until green + clean.
+- Guardrails held: no --no-verify, new commits only, subagent after the discrete fix chunk, NEXT/MISSION updated live.
+
+Last updated: 2026 (babysit phase + Bugbot Medium fix + subagent PASS)
