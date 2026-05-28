@@ -773,6 +773,9 @@ impl JobStore {
     /// set TTLs, and optionally release a unique lock key. Replaces the previous split
     /// `increment_job_retries` + `move_job_to_dlq` + conditional release pattern.
     ///
+    /// All keys touched by the script (including the optional unique lock) are declared
+    /// in the KEYS array for Redis Cluster compatibility.
+    ///
     /// Returns the new retry count on success, or -1 on script error (pcall sentinel per move_to_dlq.lua header; check Redis server logs).
     pub async fn atomic_move_job_to_dlq(
         &mut self,
@@ -793,11 +796,11 @@ impl JobStore {
             .key(job_key)
             .key(events_key)
             .key(dlq_key)
+            .key(unique)
             .arg(job_id)
             .arg(error_message)
             .arg(completion_time.to_rfc3339())
             .arg(dlq_result_ttl_seconds)
-            .arg(unique)
             .invoke_async(&mut self.conn)
             .await?;
 

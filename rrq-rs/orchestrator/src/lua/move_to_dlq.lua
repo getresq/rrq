@@ -1,6 +1,6 @@
--- KEYS: [1] = job_key, [2] = events_key, [3] = dlq_key
+-- KEYS: [1] = job_key, [2] = events_key, [3] = dlq_key, [4] = unique_lock_key (full key or empty string)
 -- ARGV: [1] = job_id, [2] = error_message, [3] = completion_time (RFC3339),
---        [4] = dlq_result_ttl_seconds, [5] = unique_lock_key (full key or empty string)
+--        [4] = dlq_result_ttl_seconds
 --
 -- Returns: new current_retries count on success, negative value on any error (check Redis logs)
 -- Error handling: outer pcall returns -1 on any error inside run() (Lua error or failing redis.call).
@@ -11,12 +11,12 @@ local function run()
     local job_key = KEYS[1]
     local events_key = KEYS[2]
     local dlq_key = KEYS[3]
+    local unique_lock_key = KEYS[4]
 
     local job_id = ARGV[1]
     local error_message = ARGV[2]
     local completion_time = ARGV[3]
     local dlq_ttl = tonumber(ARGV[4]) or 0
-    local unique_lock_key = ARGV[5]
 
     -- Increment retries as part of the terminal atomic transition (matches happy-path retry.lua)
     local new_retry_count = redis.call('HINCRBY', job_key, 'current_retries', 1)
